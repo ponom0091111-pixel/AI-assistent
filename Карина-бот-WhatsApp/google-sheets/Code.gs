@@ -1,32 +1,50 @@
 // Связка бота Карины с Google Таблицей.
 //
 // Лист расписания на месяц (например «Октябрь 2026»): каждая строка — слот 30 минут.
-// Столбцы: Дата | День недели | Время | ФИО | Процедура | ИИН | Телефон | Статус слота
+// Столбцы:
+//   A Дата | B День недели | C Начало | D Окончание | E ФИО | F Процедура | G ИИН |
+//   H Телефон | I Статус записи | J Создано | K Статус слота
+//
+// Слот занят, если в нём есть ФИО или статус записи (Бронь / Записан),
+// а также если в предыдущем слоте того же дня стоит повторный приём на 1 час.
+// «Бронь» — время держится за клиентом до оплаты, HOLD_MINUTES минут;
+// после этого неоплаченная бронь считается истёкшей и слот снова свободен.
 //
 // POST (doPost) — бот присылает JSON из блока <crm>...</crm>:
-//   • статус «Записан» или «Перенёс запись» — ФИО, процедура, ИИН и телефон
-//     записываются в слот «Дата визита» на листе расписания;
-//   • «Отменил запись» — слот освобождается;
+//   • «Бронь»          — занять слот до оплаты (как только клиент выбрал время);
+//   • «Записан»        — подтвердить запись в слоте (после оплаты);
+//   • «Перенёс запись» — освободить старый слот клиента и занять новый;
+//   • «Отменил запись» — освободить слот;
 //   • любой статус дополнительно пишется строкой в лист «Клиенты» (журнал).
+//   Ответ: {"ok":true,"start":"12:30","end":"13:00"} или {"ok":false,"error":"slot_busy"}.
 // GET (doGet) — свободные слоты для бота: ?secret=...&days=7
 //
 // createCurrentMonth / createNextMonth — создать лист расписания на месяц
-// (запускать из меню «Расписание» в таблице).
+// (меню «Расписание» в таблице).
 
 const SECRET = 'ЗАМЕНИТЕ_НА_СВОЙ_СЕКРЕТНЫЙ_КЛЮЧ';
+const HOLD_MINUTES = 60;
+const SLOT_MINUTES = 30;
 const LOG_SHEET = 'Клиенты';
-const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Дата визита', 'Напомнить', 'Категория', 'Статус'];
-const SCHEDULE_HEADERS = ['Дата', 'День недели', 'Время', 'ФИО', 'Процедура', 'ИИН', 'Телефон', 'Статус слота'];
+const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Начало визита', 'Окончание визита',
+  'Напомнить', 'Категория', 'Статус'];
+const SCHEDULE_HEADERS = ['Дата', 'День недели', 'Начало', 'Окончание', 'ФИО', 'Процедура', 'ИИН',
+  'Телефон', 'Статус записи', 'Создано', 'Статус слота'];
 const PRIMARY = 'Первичная диагностика ЖКТ';
+const REPEAT = 'Повторный приём (1 час)';
 const DAYS = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль',
   'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
 const TZ = 'Asia/Almaty';
 
+// Индексы столбцов (с нуля) в листе расписания.
+const C = { date: 0, day: 1, start: 2, end: 3, fio: 4, proc: 5, iin: 6, phone: 7, status: 8, created: 9 };
+
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Расписание')
     .addItem('Создать лист на текущий месяц', 'createCurrentMonth')
     .addItem('Создать лист на следующий месяц', 'createNextMonth')
+    .addItem('Очистить истёкшие брони', 'clearExpiredHolds')
     .addToUi();
 }
 
@@ -40,29 +58,44 @@ function doPost(e) {
   const rec = {
     fio: data['ФИО'] || '',
     iin: iin.length === 12 ? iin : '',
-    phone: data['Телефон'] || '',
+    phone: normPhone(data['Телефон']),
     visit: data['Дата визита'] || '',
     remind: data['Напомнить'] || '',
     category: data['Категория'] || '',
     status: data['Статус'] || '',
   };
 
-  logRow(rec);
-
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000);
+  lock.waitLock(20000);
+  let result = { ok: true };
   try {
-    if (rec.status === 'Записан' || rec.status === 'Перенёс запись') {
-      clearSlotsOf(rec);  // при переносе освобождаем старый слот
-      const booked = bookSlot(rec);
-      if (!booked) return json({ ok: false, error: 'slot_busy_or_missing' });
+    if (rec.status === 'Бронь' || rec.status === 'Записан') {
+      result = bookSlot(rec, rec.status);
+    } else if (rec.status === 'Перенёс запись') {
+      const v = parseVisit(rec.visit);
+      if (!v) {
+        result = { ok: false, error: 'bad_visit_date' };
+      } else {
+        // Сначала проверяем, что новый слот свободен, и только потом освобождаем старый.
+        const target = findSlot(v);
+        if (!target) result = { ok: false, error: 'slot_missing' };
+        else if (isBusy(target.rows, target.i, rec)) result = { ok: false, error: 'slot_busy' };
+        else {
+          fillFromExisting(rec);  // переносим ФИО, ИИН и телефон со старой записи
+          clearSlotsOf(rec);
+          result = bookSlot(rec, 'Записан');
+        }
+      }
     } else if (rec.status === 'Отменил запись') {
       clearSlotsOf(rec);
     }
   } finally {
     lock.releaseLock();
   }
-  return json({ ok: true });
+
+  const v = parseVisit(rec.visit);
+  logRow(rec, v ? v.time : '', v ? addMinutes(v.time, SLOT_MINUTES) : '');
+  return json(result);
 }
 
 function doGet(e) {
@@ -72,41 +105,91 @@ function doGet(e) {
   return json({ ok: true, free: freeSlots(days) });
 }
 
-// ---------- Запись в слоты ----------
+// ---------- Слоты ----------
 
-// «10.10.2026 12:30» -> { date: '10.10.2026', time: '12:30' }
+// «10.10.2026 12:30» -> { date: '10.10.2026', time: '12:30', month: 9, year: 2026 }
 function parseVisit(s) {
   const m = String(s).match(/(\d{1,2})\.(\d{1,2})\.(\d{4})\D+(\d{1,2}):(\d{2})/);
   if (!m) return null;
-  const pad = (x) => ('0' + x).slice(-2);
-  return { date: pad(m[1]) + '.' + pad(m[2]) + '.' + m[3], time: pad(m[4]) + ':' + m[5], month: Number(m[2]) - 1, year: Number(m[3]) };
+  return { date: pad(m[1]) + '.' + pad(m[2]) + '.' + m[3], time: pad(m[4]) + ':' + m[5],
+    month: Number(m[2]) - 1, year: Number(m[3]) };
 }
 
-function bookSlot(rec) {
-  const v = parseVisit(rec.visit);
-  if (!v) return false;
+function findSlot(v) {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(MONTHS[v.month] + ' ' + v.year);
-  if (!sheet) return false;
+  if (!sheet) return null;
   const rows = sheet.getDataRange().getValues();
   for (let i = 1; i < rows.length; i++) {
-    if (fmtDate(rows[i][0]) === v.date && fmtTime(rows[i][2]) === v.time) {
-      if (rows[i][3]) return false;  // слот уже занят
-      sheet.getRange(i + 1, 4, 1, 4).setValues([[rec.fio, PRIMARY, rec.iin, rec.phone]]);
-      return true;
+    if (fmtDate(rows[i][C.date]) === v.date && fmtTime(rows[i][C.start]) === v.time) {
+      return { sheet: sheet, rows: rows, i: i };
     }
   }
-  return false;
+  return null;
 }
 
-// Освобождает слоты клиента (ищем по ИИН, если он есть, иначе по ФИО).
+// Слот занят кем-то другим? Свою бронь клиент может подтвердить.
+function isBusy(rows, i, rec) {
+  const r = rows[i];
+  const prev = rows[i - 1];
+  if (prev && i > 1 && prev[C.proc] === REPEAT && fmtDate(prev[C.date]) === fmtDate(r[C.date])) {
+    return true;  // вторая половина часового повторного приёма
+  }
+  if (!r[C.fio] && !r[C.status]) return false;
+  if (r[C.status] === 'Бронь') {
+    if (holdExpired(r)) return false;
+    return !(rec && sameClient(r, rec));
+  }
+  return true;
+}
+
+function bookSlot(rec, status) {
+  const v = parseVisit(rec.visit);
+  if (!v) return { ok: false, error: 'bad_visit_date' };
+  const slot = findSlot(v);
+  if (!slot) return { ok: false, error: 'slot_missing' };
+  if (isBusy(slot.rows, slot.i, rec)) return { ok: false, error: 'slot_busy' };
+
+  const r = slot.rows[slot.i];
+  // При подтверждении сохраняем данные из брони, если в новом сообщении их нет.
+  const fio = rec.fio || (sameClient(r, rec) ? r[C.fio] : '');
+  const phone = rec.phone || (sameClient(r, rec) ? String(r[C.phone]) : '');
+  slot.sheet.getRange(slot.i + 1, C.fio + 1, 1, 6)
+    .setValues([[fio, PRIMARY, rec.iin, phone, status, new Date()]]);
+  return { ok: true, start: v.time, end: addMinutes(v.time, SLOT_MINUTES) };
+}
+
+// Освобождает слоты клиента (ищем по телефону, ИИН или ФИО).
 function clearSlotsOf(rec) {
-  if (!rec.iin && !rec.fio) return;
-  SpreadsheetApp.getActiveSpreadsheet().getSheets().forEach((sheet) => {
-    if (sheet.getRange(1, 1).getValue() !== SCHEDULE_HEADERS[0]) return;
+  if (!rec.phone && !rec.iin && !rec.fio) return;
+  scheduleSheets().forEach((sheet) => {
     const rows = sheet.getDataRange().getValues();
     for (let i = 1; i < rows.length; i++) {
-      const same = rec.iin ? String(rows[i][5]) === rec.iin : rows[i][3] === rec.fio;
-      if (same && rows[i][4] === PRIMARY) sheet.getRange(i + 1, 4, 1, 4).clearContent();
+      if (rows[i][C.proc] === PRIMARY && sameClient(rows[i], rec)) {
+        sheet.getRange(i + 1, C.fio + 1, 1, 6).clearContent();
+      }
+    }
+  });
+}
+
+// Дополняет пустые поля клиента данными из его текущей записи в расписании.
+function fillFromExisting(rec) {
+  scheduleSheets().forEach((sheet) => {
+    sheet.getDataRange().getValues().forEach((row, i) => {
+      if (i === 0 || row[C.proc] !== PRIMARY || !sameClient(row, rec)) return;
+      rec.fio = rec.fio || row[C.fio];
+      rec.iin = rec.iin || String(row[C.iin] || '');
+      rec.phone = rec.phone || normPhone(row[C.phone]);
+    });
+  });
+}
+
+function clearExpiredHolds() {
+  scheduleSheets().forEach((sheet) => {
+    const rows = sheet.getDataRange().getValues();
+    for (let i = 1; i < rows.length; i++) {
+      if (rows[i][C.status] === 'Бронь' && holdExpired(rows[i])) {
+        sheet.getRange(i + 1, C.fio + 1, 1, 6).clearContent();
+      }
     }
   });
 }
@@ -115,18 +198,36 @@ function freeSlots(days) {
   const now = new Date();
   const until = new Date(now.getTime() + days * 86400000);
   const result = [];
-  SpreadsheetApp.getActiveSpreadsheet().getSheets().forEach((sheet) => {
-    if (sheet.getRange(1, 1).getValue() !== SCHEDULE_HEADERS[0]) return;
+  scheduleSheets().forEach((sheet) => {
     const rows = sheet.getDataRange().getValues();
     for (let i = 1; i < rows.length; i++) {
-      if (rows[i][3]) continue;
-      const start = slotStart(rows[i][0], rows[i][2]);
+      if (isBusy(rows, i, null)) continue;
+      const start = slotStart(rows[i][C.date], rows[i][C.start]);
       if (start > now && start < until) {
-        result.push(fmtDate(rows[i][0]) + ' ' + rows[i][1] + ' ' + fmtTime(rows[i][2]));
+        const t = fmtTime(rows[i][C.start]);
+        result.push(fmtDate(rows[i][C.date]) + ' ' + rows[i][C.day] + ' ' + t + '–' + addMinutes(t, SLOT_MINUTES));
       }
     }
   });
   return result;
+}
+
+function sameClient(row, rec) {
+  if (rec.phone && normPhone(row[C.phone]) === rec.phone) return true;
+  if (rec.iin && String(row[C.iin]) === rec.iin) return true;
+  if (!rec.phone && !rec.iin && rec.fio && row[C.fio] === rec.fio) return true;
+  return false;
+}
+
+function holdExpired(row) {
+  const created = row[C.created];
+  if (!(created instanceof Date)) return false;
+  return Date.now() - created.getTime() > HOLD_MINUTES * 60000;
+}
+
+function scheduleSheets() {
+  return SpreadsheetApp.getActiveSpreadsheet().getSheets()
+    .filter((s) => s.getRange(1, 1).getValue() === SCHEDULE_HEADERS[0]);
 }
 
 // ---------- Создание листа на месяц ----------
@@ -153,28 +254,33 @@ function createMonth(year, month) {
     const wd = d.getDay();
     if (wd === 0) continue;  // воскресенье — выходной
     const lastMin = wd === 6 ? 14 * 60 + 30 : 19 * 60 + 30;
-    for (let m = 11 * 60; m <= lastMin; m += 30) {
-      const t = ('0' + Math.floor(m / 60)).slice(-2) + ':' + ('0' + (m % 60)).slice(-2);
-      rows.push([new Date(d), DAYS[wd], t, '', '', '', '', '']);
+    for (let m = 11 * 60; m <= lastMin; m += SLOT_MINUTES) {
+      const t = pad(Math.floor(m / 60)) + ':' + pad(m % 60);
+      rows.push([new Date(d), DAYS[wd], t, addMinutes(t, SLOT_MINUTES), '', '', '', '', '', '', '']);
     }
   }
+  const n = rows.length;
   const sheet = ss.insertSheet(name);
   sheet.getRange(1, 1, 1, SCHEDULE_HEADERS.length).setValues([SCHEDULE_HEADERS])
     .setFontWeight('bold').setFontColor('#ffffff').setBackground('#2e7d32');
-  sheet.getRange(2, 1, rows.length, SCHEDULE_HEADERS.length).setValues(rows);
-  sheet.getRange(2, 1, rows.length, 1).setNumberFormat('dd.MM.yyyy');
-  sheet.getRange(2, 3, rows.length, 1).setNumberFormat('@');
-  sheet.getRange(2, 6, rows.length, 2).setNumberFormat('@');
-  sheet.getRange(2, 8, rows.length, 1).setFormulaR1C1('=IF(R[0]C4="","Свободно","Занято")');
-  sheet.getRange(2, 5, rows.length, 1).setDataValidation(
-    SpreadsheetApp.newDataValidation().requireValueInList([PRIMARY, 'Повторный приём (1 час)']).build());
+  sheet.getRange(2, 3, n, 2).setNumberFormat('@');
+  sheet.getRange(2, 7, n, 2).setNumberFormat('@');
+  sheet.getRange(2, 1, n, SCHEDULE_HEADERS.length).setValues(rows);
+  sheet.getRange(2, 1, n, 1).setNumberFormat('dd.MM.yyyy');
+  sheet.getRange(2, 10, n, 1).setNumberFormat('dd.MM.yyyy HH:mm');
+  sheet.getRange(2, 11, n, 1).setFormulaR1C1(
+    '=IF(OR(R[0]C5<>"",R[0]C9<>""),"Занято",IF(AND(R[-1]C6="' + REPEAT + '",R[-1]C1=R[0]C1),"Занято","Свободно"))');
+  sheet.getRange(2, 6, n, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList([PRIMARY, REPEAT]).build());
+  sheet.getRange(2, 9, n, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList(['Бронь', 'Записан']).build());
   sheet.setFrozenRows(1);
-  [12, 14, 8, 34, 30, 15, 16, 13].forEach((w, i) => sheet.setColumnWidth(i + 1, w * 7));
+  [12, 14, 8, 10, 32, 28, 15, 16, 14, 16, 13].forEach((w, i) => sheet.setColumnWidth(i + 1, w * 7));
 }
 
 // ---------- Вспомогательное ----------
 
-function logRow(rec) {
+function logRow(rec, start, end) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(LOG_SHEET);
   if (!sheet) {
@@ -183,7 +289,26 @@ function logRow(rec) {
     sheet.setFrozenRows(1);
     sheet.getRange('C:D').setNumberFormat('@');  // ИИН и телефон как текст
   }
-  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone, rec.visit, rec.remind, rec.category, rec.status]);
+  const v = parseVisit(rec.visit);
+  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone,
+    v ? v.date + ' ' + start : '', v ? v.date + ' ' + end : '',
+    rec.remind, rec.category, rec.status]);
+}
+
+function normPhone(p) {
+  const d = String(p || '').replace(/\D/g, '');
+  if (!d) return '';
+  return d.length === 11 && d[0] === '8' ? '7' + d.slice(1) : d;
+}
+
+function addMinutes(hhmm, minutes) {
+  const [h, m] = String(hhmm).split(':').map(Number);
+  const total = h * 60 + m + minutes;
+  return pad(Math.floor(total / 60)) + ':' + pad(total % 60);
+}
+
+function pad(x) {
+  return ('0' + x).slice(-2);
 }
 
 function fmtDate(v) {
