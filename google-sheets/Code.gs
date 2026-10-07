@@ -15,7 +15,7 @@
 
 const SECRET = 'ЗАМЕНИТЕ_НА_СВОЙ_СЕКРЕТНЫЙ_КЛЮЧ';
 const LOG_SHEET = 'Клиенты';
-const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Дата визита', 'Напомнить', 'Статус'];
+const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Дата визита', 'Напомнить', 'Категория', 'Статус'];
 const SCHEDULE_HEADERS = ['Дата', 'День недели', 'Время', 'ФИО', 'Процедура', 'ИИН', 'Телефон', 'Статус слота'];
 const PRIMARY = 'Первичная диагностика ЖКТ';
 const DAYS = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
@@ -43,6 +43,7 @@ function doPost(e) {
     phone: data['Телефон'] || '',
     visit: data['Дата визита'] || '',
     remind: data['Напомнить'] || '',
+    category: data['Категория'] || '',
     status: data['Статус'] || '',
   };
 
@@ -182,7 +183,7 @@ function logRow(rec) {
     sheet.setFrozenRows(1);
     sheet.getRange('C:D').setNumberFormat('@');  // ИИН и телефон как текст
   }
-  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone, rec.visit, rec.remind, rec.status]);
+  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone, rec.visit, rec.remind, rec.category, rec.status]);
 }
 
 function fmtDate(v) {
