@@ -133,10 +133,8 @@ function isBusy(rows, i, rec) {
     return true;  // вторая половина часового повторного приёма
   }
   if (!r[C.fio] && !r[C.status]) return false;
-  if (r[C.status] === 'Бронь') {
-    if (holdExpired(r)) return false;
-    return !(rec && sameClient(r, rec));
-  }
+  if (rec && sameClient(r, rec)) return false;  // своё окно клиент может обновить (например, дослать ФИО и ИИН)
+  if (r[C.status] === 'Бронь' && holdExpired(r)) return false;
   return true;
 }
 
