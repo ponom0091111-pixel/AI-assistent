@@ -14,6 +14,7 @@
 //   • «Бронь»          — занять слот до оплаты (как только клиент выбрал время);
 //   • «Записан»        — подтвердить запись в слоте (после оплаты);
 //   • «Перенёс запись» — освободить старый слот клиента и занять новый;
+//   У клиента всегда одна запись: при любой новой брони/записи старая удаляется.
 //   • «Отменил запись» — освободить слот;
 //   • любой статус дополнительно пишется строкой в лист «Клиенты» (журнал).
 //   Ответ: {"ok":true,"start":"12:30","end":"13:00"} или {"ok":false,"error":"slot_busy"}.
@@ -74,23 +75,8 @@ function doPost(e) {
   lock.waitLock(20000);
   let result = { ok: true };
   try {
-    if (rec.status === 'Бронь' || rec.status === 'Записан') {
-      result = bookSlot(rec, rec.status);
-    } else if (rec.status === 'Перенёс запись') {
-      const v = parseVisit(rec.visit);
-      if (!v) {
-        result = { ok: false, error: 'bad_visit_date' };
-      } else {
-        // Сначала проверяем, что новый слот свободен, и только потом освобождаем старый.
-        const target = findSlot(v);
-        if (!target) result = { ok: false, error: 'slot_missing' };
-        else if (isBusy(target.rows, target.i, rec)) result = { ok: false, error: 'slot_busy' };
-        else {
-          fillFromExisting(rec);  // переносим ФИО, ИИН и телефон со старой записи
-          clearSlotsOf(rec);
-          result = bookSlot(rec, 'Записан');
-        }
-      }
+    if (rec.status === 'Бронь' || rec.status === 'Записан' || rec.status === 'Перенёс запись') {
+      result = moveClientTo(rec, rec.status === 'Бронь' ? 'Бронь' : 'Записан');
     } else if (rec.status === 'Отменил запись') {
       clearSlotsOf(rec);
     }
@@ -175,6 +161,20 @@ function clearSlotsOf(rec) {
       }
     }
   });
+}
+
+// У клиента в расписании всегда одна запись: новая заменяет старую.
+// Сначала проверяем, что новое время свободно, и только потом удаляем старую запись
+// клиента (бронь или запись на другое время/день) и занимаем новый слот.
+function moveClientTo(rec, status) {
+  const v = parseVisit(rec.visit);
+  if (!v) return { ok: false, error: 'bad_visit_date' };
+  const target = findSlot(v);
+  if (!target) return { ok: false, error: 'slot_missing' };
+  if (isBusy(target.rows, target.i, rec)) return { ok: false, error: 'slot_busy' };
+  fillFromExisting(rec);  // переносим ФИО, ИИН, телефон и источник со старой записи
+  clearSlotsOf(rec);
+  return bookSlot(rec, status);
 }
 
 // Дополняет пустые поля клиента данными из его текущей записи в расписании.
