@@ -19,6 +19,7 @@
 //   • любой статус дополнительно пишется строкой в лист «Клиенты» (журнал).
 //   Ответ: {"ok":true,"start":"12:30","end":"13:00"} или {"ok":false,"error":"slot_busy"}.
 // GET (doGet) — свободные слоты для бота: ?secret=...&days=7
+//   Ответ: {"recommended": [окна рядом с уже записанными], "free": [все свободные окна]}
 //
 // createCurrentMonth / createNextMonth — создать лист расписания на месяц
 // (меню «Расписание» в таблице).
@@ -93,7 +94,13 @@ function doGet(e) {
   const p = e.parameter || {};
   if (p.secret !== SECRET) return json({ ok: false, error: 'forbidden' });
   const days = Math.min(Number(p.days) || 7, 31);
-  return json({ ok: true, free: freeSlots(days) });
+  const slots = freeSlots(days);
+  return json({
+    ok: true,
+    // Сначала предлагаем окна рядом с уже записанными клиентами, чтобы записи шли плотно.
+    recommended: slots.filter((s) => s.near).map((s) => s.text),
+    free: slots.map((s) => s.text),
+  });
 }
 
 // ---------- Слоты ----------
@@ -201,6 +208,9 @@ function clearExpiredHolds() {
   });
 }
 
+// Свободные слоты на ближайшие days дней.
+// near = соседний слот того же дня уже занят (запись, бронь или повторный приём).
+// Подпись (день) — начало до 15:00, (вечер) — с 15:00.
 function freeSlots(days) {
   const now = new Date();
   const until = new Date(now.getTime() + days * 86400000);
@@ -210,10 +220,15 @@ function freeSlots(days) {
     for (let i = 1; i < rows.length; i++) {
       if (isBusy(rows, i, null)) continue;
       const start = slotStart(rows[i][C.date], rows[i][C.start]);
-      if (start > now && start < until) {
-        const t = fmtTime(rows[i][C.start]);
-        result.push(fmtDate(rows[i][C.date]) + ' ' + rows[i][C.day] + ' ' + t + '–' + addMinutes(t, SLOT_MINUTES));
-      }
+      if (!(start > now && start < until)) continue;
+      const day = fmtDate(rows[i][C.date]);
+      const sameDayBusy = (j) => j >= 1 && j < rows.length && fmtDate(rows[j][C.date]) === day && isBusy(rows, j, null);
+      const t = fmtTime(rows[i][C.start]);
+      result.push({
+        text: day + ' ' + rows[i][C.day] + ' ' + t + '–' + addMinutes(t, SLOT_MINUTES) +
+          (Number(t.slice(0, 2)) < 15 ? ' (день)' : ' (вечер)'),
+        near: sameDayBusy(i - 1) || sameDayBusy(i + 1),
+      });
     }
   });
   return result;
