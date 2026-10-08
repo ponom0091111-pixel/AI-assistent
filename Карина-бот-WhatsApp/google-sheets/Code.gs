@@ -3,7 +3,7 @@
 // Лист расписания на месяц (например «Октябрь 2026»): каждая строка — слот 30 минут.
 // Столбцы:
 //   A Дата | B День недели | C Начало | D Окончание | E ФИО | F Процедура | G ИИН |
-//   H Телефон | I Статус записи | J Создано | K Статус слота
+//   H Телефон | I Источник | J Статус записи | K Создано | L Статус слота
 //
 // Слот занят, если в нём есть ФИО или статус записи (Бронь / Записан),
 // а также если в предыдущем слоте того же дня стоит повторный приём на 1 час.
@@ -26,10 +26,12 @@ const SECRET = 'ЗАМЕНИТЕ_НА_СВОЙ_СЕКРЕТНЫЙ_КЛЮЧ';
 const HOLD_MINUTES = 60;
 const SLOT_MINUTES = 30;
 const LOG_SHEET = 'Клиенты';
-const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Начало визита', 'Окончание визита',
-  'Напомнить', 'Категория', 'Статус'];
+const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Источник', 'Начало визита',
+  'Окончание визита', 'Напомнить', 'Категория', 'Статус'];
 const SCHEDULE_HEADERS = ['Дата', 'День недели', 'Начало', 'Окончание', 'ФИО', 'Процедура', 'ИИН',
-  'Телефон', 'Статус записи', 'Создано', 'Статус слота'];
+  'Телефон', 'Источник', 'Статус записи', 'Создано', 'Статус слота'];
+const SOURCES = ['Instagram — платная реклама', 'Instagram — бесплатно', 'Facebook — платная реклама',
+  'Facebook — бесплатно', '2ГИС', 'Рекомендация', 'Другое', 'Не указан'];
 const PRIMARY = 'Первичная диагностика ЖКТ';
 const REPEAT = 'Повторный приём (1 час)';
 const DAYS = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
@@ -38,7 +40,9 @@ const MONTHS = ['Январь', 'Февраль', 'Март', 'Апрель', '�
 const TZ = 'Asia/Almaty';
 
 // Индексы столбцов (с нуля) в листе расписания.
-const C = { date: 0, day: 1, start: 2, end: 3, fio: 4, proc: 5, iin: 6, phone: 7, status: 8, created: 9 };
+const C = { date: 0, day: 1, start: 2, end: 3, fio: 4, proc: 5, iin: 6, phone: 7, source: 8, status: 9, created: 10 };
+// Сколько столбцов занимает запись клиента: от ФИО до «Создано».
+const REC_COLS = C.created - C.fio + 1;
 
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('Расписание')
@@ -62,6 +66,7 @@ function doPost(e) {
     visit: data['Дата визита'] || '',
     remind: data['Напомнить'] || '',
     category: data['Категория'] || '',
+    source: data['Источник'] || '',
     status: data['Статус'] || '',
   };
 
@@ -153,8 +158,9 @@ function bookSlot(rec, status) {
   // При подтверждении сохраняем данные из брони, если в новом сообщении их нет.
   const fio = rec.fio || (sameClient(r, rec) ? r[C.fio] : '');
   const phone = rec.phone || (sameClient(r, rec) ? String(r[C.phone]) : '');
-  slot.sheet.getRange(slot.i + 1, C.fio + 1, 1, 6)
-    .setValues([[fio, PRIMARY, rec.iin, phone, status, new Date()]]);
+  const source = rec.source || (sameClient(r, rec) ? r[C.source] : '');
+  slot.sheet.getRange(slot.i + 1, C.fio + 1, 1, REC_COLS)
+    .setValues([[fio, PRIMARY, rec.iin, phone, source, status, new Date()]]);
   return { ok: true, start: v.time, end: addMinutes(v.time, SLOT_MINUTES) };
 }
 
@@ -165,7 +171,7 @@ function clearSlotsOf(rec) {
     const rows = sheet.getDataRange().getValues();
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][C.proc] === PRIMARY && sameClient(rows[i], rec)) {
-        sheet.getRange(i + 1, C.fio + 1, 1, 6).clearContent();
+        sheet.getRange(i + 1, C.fio + 1, 1, REC_COLS).clearContent();
       }
     }
   });
@@ -179,6 +185,7 @@ function fillFromExisting(rec) {
       rec.fio = rec.fio || row[C.fio];
       rec.iin = rec.iin || String(row[C.iin] || '');
       rec.phone = rec.phone || normPhone(row[C.phone]);
+      rec.source = rec.source || row[C.source];
     });
   });
 }
@@ -188,7 +195,7 @@ function clearExpiredHolds() {
     const rows = sheet.getDataRange().getValues();
     for (let i = 1; i < rows.length; i++) {
       if (rows[i][C.status] === 'Бронь' && holdExpired(rows[i])) {
-        sheet.getRange(i + 1, C.fio + 1, 1, 6).clearContent();
+        sheet.getRange(i + 1, C.fio + 1, 1, REC_COLS).clearContent();
       }
     }
   });
@@ -256,7 +263,7 @@ function createMonth(year, month) {
     const lastMin = wd === 6 ? 14 * 60 + 30 : 19 * 60 + 30;
     for (let m = 11 * 60; m <= lastMin; m += SLOT_MINUTES) {
       const t = pad(Math.floor(m / 60)) + ':' + pad(m % 60);
-      rows.push([new Date(d), DAYS[wd], t, addMinutes(t, SLOT_MINUTES), '', '', '', '', '', '', '']);
+      rows.push([new Date(d), DAYS[wd], t, addMinutes(t, SLOT_MINUTES), '', '', '', '', '', '', '', '']);
     }
   }
   const n = rows.length;
@@ -267,15 +274,17 @@ function createMonth(year, month) {
   sheet.getRange(2, 7, n, 2).setNumberFormat('@');
   sheet.getRange(2, 1, n, SCHEDULE_HEADERS.length).setValues(rows);
   sheet.getRange(2, 1, n, 1).setNumberFormat('dd.MM.yyyy');
-  sheet.getRange(2, 10, n, 1).setNumberFormat('dd.MM.yyyy HH:mm');
-  sheet.getRange(2, 11, n, 1).setFormulaR1C1(
-    '=IF(OR(R[0]C5<>"",R[0]C9<>""),"Занято",IF(AND(R[-1]C6="' + REPEAT + '",R[-1]C1=R[0]C1),"Занято","Свободно"))');
+  sheet.getRange(2, 11, n, 1).setNumberFormat('dd.MM.yyyy HH:mm');
+  sheet.getRange(2, 12, n, 1).setFormulaR1C1(
+    '=IF(OR(R[0]C5<>"",R[0]C10<>""),"Занято",IF(AND(R[-1]C6="' + REPEAT + '",R[-1]C1=R[0]C1),"Занято","Свободно"))');
   sheet.getRange(2, 6, n, 1).setDataValidation(
     SpreadsheetApp.newDataValidation().requireValueInList([PRIMARY, REPEAT]).build());
   sheet.getRange(2, 9, n, 1).setDataValidation(
+    SpreadsheetApp.newDataValidation().requireValueInList(SOURCES).build());
+  sheet.getRange(2, 10, n, 1).setDataValidation(
     SpreadsheetApp.newDataValidation().requireValueInList(['Бронь', 'Записан']).build());
   sheet.setFrozenRows(1);
-  [12, 14, 8, 10, 32, 28, 15, 16, 14, 16, 13].forEach((w, i) => sheet.setColumnWidth(i + 1, w * 7));
+  [12, 14, 8, 10, 32, 28, 15, 16, 22, 14, 16, 13].forEach((w, i) => sheet.setColumnWidth(i + 1, w * 7));
 }
 
 // ---------- Вспомогательное ----------
@@ -290,7 +299,7 @@ function logRow(rec, start, end) {
     sheet.getRange('C:D').setNumberFormat('@');  // ИИН и телефон как текст
   }
   const v = parseVisit(rec.visit);
-  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone,
+  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone, rec.source,
     v ? v.date + ' ' + start : '', v ? v.date + ' ' + end : '',
     rec.remind, rec.category, rec.status]);
 }
