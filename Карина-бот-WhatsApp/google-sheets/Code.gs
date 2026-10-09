@@ -302,6 +302,8 @@ function createMonth(year, month) {
 
 // ---------- Вспомогательное ----------
 
+// Журнал «Клиенты»: по одной строке на клиента (ищем по телефону, ИИН или ФИО).
+// Новые данные обновляют строку клиента, а не добавляют новую — хранится только актуальное.
 function logRow(rec, start, end) {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(LOG_SHEET);
@@ -312,9 +314,25 @@ function logRow(rec, start, end) {
     sheet.getRange('C:D').setNumberFormat('@');  // ИИН и телефон как текст
   }
   const v = parseVisit(rec.visit);
-  sheet.appendRow([new Date(), rec.fio, rec.iin, rec.phone, rec.source,
-    v ? v.date + ' ' + start : '', v ? v.date + ' ' + end : '',
-    rec.remind, rec.category, rec.status]);
+  const rows = sheet.getDataRange().getValues();
+  let idx = -1;
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    if ((rec.phone && normPhone(r[3]) === rec.phone) || (rec.iin && String(r[2]) === rec.iin) ||
+        (!rec.phone && !rec.iin && rec.fio && r[1] === rec.fio)) {
+      idx = i;
+      break;
+    }
+  }
+  const old = idx > 0 ? rows[idx] : ['', '', '', '', '', '', '', '', '', ''];
+  const keep = (val, i) => val || old[i] || '';
+  const cancelled = rec.status === 'Отменил запись';
+  const row = [new Date(), keep(rec.fio, 1), keep(rec.iin, 2), keep(rec.phone, 3), keep(rec.source, 4),
+    cancelled ? '' : (v ? v.date + ' ' + start : old[5] || ''),
+    cancelled ? '' : (v ? v.date + ' ' + end : old[6] || ''),
+    rec.remind || old[7] || '', keep(rec.category, 8), rec.status || old[9] || ''];
+  if (idx > 0) sheet.getRange(idx + 1, 1, 1, row.length).setValues([row]);
+  else sheet.appendRow(row);
 }
 
 function normPhone(p) {
