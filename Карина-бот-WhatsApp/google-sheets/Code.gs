@@ -18,6 +18,7 @@
 //   • «Отменил запись» — освободить слот;
 //   • любой статус дополнительно пишется строкой в лист «Клиенты» (журнал).
 //   Ответ: {"ok":true,"start":"12:30","end":"13:00"} или {"ok":false,"error":"slot_busy"}.
+//   Перенос оплаченной записи: reschedule_limit (уже переносили) или too_late (меньше суток) — бронь сгорает.
 // GET (doGet) — свободные слоты для бота: ?secret=...&days=7
 //   Ответ: {"recommended": [окна рядом с уже записанными], "free": [все свободные окна]}
 //
@@ -29,7 +30,10 @@ const HOLD_MINUTES = 60;
 const SLOT_MINUTES = 30;
 const LOG_SHEET = 'Клиенты';
 const LOG_HEADERS = ['Дата и время', 'ФИО', 'ИИН', 'Телефон', 'Источник', 'Начало визита',
-  'Окончание визита', 'Напомнить', 'Категория', 'Статус'];
+  'Окончание визита', 'Напомнить', 'Категория', 'Статус', 'Переносов'];
+// Правила оплаченной брони: перенос — только один раз и не позднее чем за сутки до визита.
+const MAX_RESCHEDULES = 1;
+const RESCHEDULE_MIN_HOURS = 24;
 const SCHEDULE_HEADERS = ['Дата', 'День недели', 'Начало', 'Окончание', 'ФИО', 'Процедура', 'ИИН',
   'Телефон', 'Источник', 'Статус записи', 'Создано', 'Статус слота'];
 const SOURCES = ['Instagram — платная реклама', 'Instagram — бесплатно', 'Facebook — платная реклама',
@@ -76,17 +80,22 @@ function doPost(e) {
   lock.waitLock(20000);
   let result = { ok: true };
   try {
-    if (rec.status === 'Бронь' || rec.status === 'Записан' || rec.status === 'Перенёс запись') {
-      result = moveClientTo(rec, rec.status === 'Бронь' ? 'Бронь' : 'Записан');
+    if (rec.status === 'Перенёс запись') {
+      result = checkReschedule(rec);
+      if (result.ok) result = moveClientTo(rec, 'Записан');
+    } else if (rec.status === 'Бронь' || rec.status === 'Записан') {
+      result = moveClientTo(rec, rec.status);
     } else if (rec.status === 'Отменил запись') {
       clearSlotsOf(rec);
+    }
+    // Журнал обновляем только при успехе, чтобы отказ (занято, перенос запрещён) не менял данные клиента.
+    if (result.ok) {
+      const v = parseVisit(rec.visit);
+      logRow(rec, v ? v.time : '', v ? addMinutes(v.time, SLOT_MINUTES) : '');
     }
   } finally {
     lock.releaseLock();
   }
-
-  const v = parseVisit(rec.visit);
-  logRow(rec, v ? v.time : '', v ? addMinutes(v.time, SLOT_MINUTES) : '');
   return json(result);
 }
 
@@ -166,6 +175,27 @@ function clearSlotsOf(rec) {
       }
     }
   });
+}
+
+// Перенос оплаченной записи: не больше MAX_RESCHEDULES раз и не позднее чем за сутки до визита.
+// Ответ с ошибкой reschedule_limit или too_late означает, что бронь сгорает.
+function checkReschedule(rec) {
+  let visitStart = null;
+  scheduleSheets().forEach((sheet) => {
+    sheet.getDataRange().getValues().forEach((row, i) => {
+      if (i > 0 && row[C.status] === 'Записан' && sameClient(row, rec)) {
+        visitStart = slotStart(row[C.date], row[C.start]);
+      }
+    });
+  });
+  if (!visitStart) return { ok: true };  // оплаченной записи нет — переносить нечего
+  const log = findLogRow(rec);
+  const done = log ? Number(log.row[10]) || 0 : 0;
+  if (done >= MAX_RESCHEDULES) return { ok: false, error: 'reschedule_limit' };
+  if (visitStart.getTime() - Date.now() < RESCHEDULE_MIN_HOURS * 3600000) {
+    return { ok: false, error: 'too_late' };
+  }
+  return { ok: true };
 }
 
 // У клиента в расписании всегда одна запись: новая заменяет старую.
@@ -304,7 +334,7 @@ function createMonth(year, month) {
 
 // Журнал «Клиенты»: по одной строке на клиента (ищем по телефону, ИИН или ФИО).
 // Новые данные обновляют строку клиента, а не добавляют новую — хранится только актуальное.
-function logRow(rec, start, end) {
+function logSheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(LOG_SHEET);
   if (!sheet) {
@@ -313,25 +343,38 @@ function logRow(rec, start, end) {
     sheet.setFrozenRows(1);
     sheet.getRange('C:D').setNumberFormat('@');  // ИИН и телефон как текст
   }
-  const v = parseVisit(rec.visit);
+  return sheet;
+}
+
+function findLogRow(rec) {
+  const sheet = logSheet();
   const rows = sheet.getDataRange().getValues();
-  let idx = -1;
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     if ((rec.phone && normPhone(r[3]) === rec.phone) || (rec.iin && String(r[2]) === rec.iin) ||
         (!rec.phone && !rec.iin && rec.fio && r[1] === rec.fio)) {
-      idx = i;
-      break;
+      return { sheet: sheet, idx: i, row: r };
     }
   }
-  const old = idx > 0 ? rows[idx] : ['', '', '', '', '', '', '', '', '', ''];
+  return null;
+}
+
+function logRow(rec, start, end) {
+  const found = findLogRow(rec);
+  const sheet = found ? found.sheet : logSheet();
+  const v = parseVisit(rec.visit);
+  const old = found ? found.row : ['', '', '', '', '', '', '', '', '', '', 0];
   const keep = (val, i) => val || old[i] || '';
   const cancelled = rec.status === 'Отменил запись';
+  // Счётчик переносов: новая бронь начинает его заново, успешный перенос увеличивает.
+  let moves = Number(old[10]) || 0;
+  if (rec.status === 'Бронь') moves = 0;
+  if (rec.status === 'Перенёс запись') moves += 1;
   const row = [new Date(), keep(rec.fio, 1), keep(rec.iin, 2), keep(rec.phone, 3), keep(rec.source, 4),
     cancelled ? '' : (v ? v.date + ' ' + start : old[5] || ''),
     cancelled ? '' : (v ? v.date + ' ' + end : old[6] || ''),
-    rec.remind || old[7] || '', keep(rec.category, 8), rec.status || old[9] || ''];
-  if (idx > 0) sheet.getRange(idx + 1, 1, 1, row.length).setValues([row]);
+    rec.remind || old[7] || '', keep(rec.category, 8), rec.status || old[9] || '', moves];
+  if (found) sheet.getRange(found.idx + 1, 1, 1, row.length).setValues([row]);
   else sheet.appendRow(row);
 }
 
